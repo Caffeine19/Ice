@@ -141,6 +141,14 @@ final class MenuBarManager: ObservableObject {
             }
             .store(in: &c)
 
+        // Update control item states when per-display configurations change.
+        appState?.settingsManager.displaySettingsManager.$configurations
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.updateControlItemStates()
+            }
+            .store(in: &c)
+
         Timer.publish(every: 5, on: .main, in: .default)
             .autoconnect()
             .sink { [weak self] _ in
@@ -166,6 +174,7 @@ final class MenuBarManager: ObservableObject {
                 //   * The settings window is visible.
                 guard
                     appState.settingsManager.advancedSettingsManager.hideApplicationMenus,
+                    !appState.settingsManager.displaySettingsManager.configurationForActiveDisplay().useIceBar,
                     !isMenuBarHiddenBySystem,
                     !appState.isActiveSpaceFullscreen,
                     appState.settingsWindow?.isVisible == false
@@ -394,6 +403,16 @@ final class MenuBarManager: ObservableObject {
     /// Returns the menu bar section with the given name.
     func section(withName name: MenuBarSection.Name) -> MenuBarSection? {
         sections.first { $0.name == name }
+    }
+
+    /// Updates the hiding state of the control item for each section.
+    ///
+    /// - Parameter screen: The screen to use for the update. If `nil`, the
+    ///   best screen is determined automatically.
+    func updateControlItemStates(for screen: NSScreen? = nil) {
+        for section in sections {
+            section.updateControlItemState(for: screen)
+        }
     }
 }
 

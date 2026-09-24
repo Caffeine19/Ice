@@ -6,6 +6,7 @@
 /// An identifier used for navigation in the settings interface.
 enum SettingsNavigationIdentifier: String, NavigationIdentifier {
     case general = "General"
+    case displays = "Displays"
     case menuBarLayout = "Menu Bar Layout"
     case menuBarAppearance = "Menu Bar Appearance"
     case hotkeys = "Hotkeys"

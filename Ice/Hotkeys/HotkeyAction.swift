@@ -40,7 +40,7 @@ enum HotkeyAction: String, Codable, CaseIterable {
         case .searchMenuBarItems:
             await appState.menuBarManager.searchPanel.toggle()
         case .enableIceBar:
-            appState.settingsManager.generalSettingsManager.useIceBar.toggle()
+            appState.settingsManager.displaySettingsManager.toggleIceBarForActiveDisplay()
         case .showSectionDividers:
             appState.settingsManager.advancedSettingsManager.showSectionDividers.toggle()
         case .toggleApplicationMenus:

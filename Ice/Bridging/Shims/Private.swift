@@ -52,6 +52,11 @@ func CGSSetConnectionProperty(
     _ value: CFTypeRef
 ) -> CGError
 
+// MARK: - CGSDisplay Functions
+
+@_silgen_name("CGSCopyActiveMenuBarDisplayIdentifier")
+func CGSCopyActiveMenuBarDisplayIdentifier(_ cid: CGSConnectionID) -> Unmanaged<CFString>?
+
 // MARK: - CGSEvent Functions
 
 @_silgen_name("CGSEventIsAppUnresponsive")

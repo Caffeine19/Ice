@@ -61,9 +61,6 @@ struct GeneralSettingsPane: View {
                 iceIconOptions
             }
             IceSection {
-                iceBarOptions
-            }
-            IceSection {
                 showOnClick
                 showOnHover
                 showOnScroll
@@ -157,39 +154,6 @@ struct GeneralSettingsPane: View {
             if case .custom = manager.iceIcon.name {
                 Toggle("Apply system theme to icon", isOn: manager.bindings.customIceIconIsTemplate)
                     .annotation("Display the icon as a monochrome image matching the system appearance")
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var iceBarOptions: some View {
-        useIceBar
-        if manager.useIceBar {
-            iceBarLocationPicker
-        }
-    }
-
-    @ViewBuilder
-    private var useIceBar: some View {
-        Toggle("Use Ice Bar", isOn: manager.bindings.useIceBar)
-            .annotation("Show hidden menu bar items in a separate bar below the menu bar")
-    }
-
-    @ViewBuilder
-    private var iceBarLocationPicker: some View {
-        IcePicker("Location", selection: manager.bindings.iceBarLocation) {
-            ForEach(IceBarLocation.allCases) { location in
-                Text(location.localized).icePickerID(location)
-            }
-        }
-        .annotation {
-            switch manager.iceBarLocation {
-            case .dynamic:
-                Text("The Ice Bar's location changes based on context")
-            case .mousePointer:
-                Text("The Ice Bar is centered below the mouse pointer")
-            case .iceIcon:
-                Text("The Ice Bar is centered below the Ice icon")
             }
         }
     }

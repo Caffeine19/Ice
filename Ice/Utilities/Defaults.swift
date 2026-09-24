@@ -174,6 +174,7 @@ extension Defaults {
 
         case iceBarLocation = "IceBarLocation"
         case iceBarPinnedLocation = "IceBarPinnedLocation"
+        case displayIceBarConfigurations = "DisplayIceBarConfigurations"
 
         // MARK: Migration
 
@@ -181,6 +182,7 @@ extension Defaults {
         case hasMigrated0_10_0 = "hasMigrated0_10_0"
         case hasMigrated0_10_1 = "hasMigrated0_10_1"
         case hasMigrated0_11_10 = "hasMigrated0_11_10"
+        case hasMigratedPerDisplayIceBar = "HasMigratedPerDisplayIceBar"
 
         // MARK: Deprecated
 
@@ -196,5 +198,8 @@ extension Defaults {
         case menuBarFullShapeInfo = "MenuBarFullShapeInfo"
         case menuBarSplitShapeInfo = "MenuBarSplitShapeInfo"
         case menuBarAppearanceConfiguration = "MenuBarAppearanceConfiguration"
+
+        // Deprecated keys, read by settings migration only.
+        case useIceBarOnlyOnNotchedDisplay = "UseIceBarOnlyOnNotchedDisplay"
     }
 }

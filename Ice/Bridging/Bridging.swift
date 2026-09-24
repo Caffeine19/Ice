@@ -47,6 +47,88 @@ extension Bridging {
     }
 }
 
+// MARK: - CGDisplay
+
+extension Bridging {
+    /// Returns a list of identifiers for all active displays.
+    private static func getActiveDisplayList() -> [CGDirectDisplayID] {
+        var count: UInt32 = 0
+        var result = CGGetActiveDisplayList(0, nil, &count)
+        guard result == .success else {
+            Logger.bridging.error("CGGetActiveDisplayList failed with error \(result.logString)")
+            return []
+        }
+        var list = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        result = CGGetActiveDisplayList(count, &list, nil)
+        guard result == .success else {
+            Logger.bridging.error("CGGetActiveDisplayList failed with error \(result.logString)")
+            return []
+        }
+        return list
+    }
+
+    /// Returns the UUID for the given display.
+    private static func getDisplayUUID(for displayID: CGDirectDisplayID) -> CFUUID? {
+        guard let uuid = CGDisplayCreateUUIDFromDisplayID(displayID) else {
+            Logger.bridging.error("CGDisplayCreateUUIDFromDisplayID returned nil for display \(displayID)")
+            return nil
+        }
+        return uuid.takeRetainedValue()
+    }
+
+    /// Returns the UUID string for the given display.
+    ///
+    /// - Parameter displayID: An identifier for a display.
+    /// - Returns: The UUID string for the display, or `nil` if unavailable.
+    static func getDisplayUUIDString(for displayID: CGDirectDisplayID) -> String? {
+        guard let uuid = getDisplayUUID(for: displayID) else {
+            return nil
+        }
+        return CFUUIDCreateString(nil, uuid) as String?
+    }
+
+    /// Returns the identifier for the display with the given UUID string.
+    ///
+    /// - Parameter uuidString: The UUID string of a display.
+    /// - Returns: The display identifier, or `nil` if not found.
+    static func getDisplayID(for uuidString: String) -> CGDirectDisplayID? {
+        guard let uuid = CFUUIDCreateFromString(nil, uuidString as CFString) else {
+            return nil
+        }
+        return getActiveDisplayList().first { displayID in
+            guard let displayUUID = getDisplayUUID(for: displayID) else {
+                return false
+            }
+            return CFEqual(displayUUID, uuid)
+        }
+    }
+
+    /// Returns the UUID string for the display with the active menu bar.
+    static func getActiveMenuBarDisplayUUID() -> String? {
+        guard let displayID = getActiveMenuBarDisplayID() else {
+            return nil
+        }
+        return getDisplayUUIDString(for: displayID)
+    }
+
+    /// Returns the identifier of the display with the active menu bar.
+    static func getActiveMenuBarDisplayID() -> CGDirectDisplayID? {
+        guard
+            let string = CGSCopyActiveMenuBarDisplayIdentifier(CGSMainConnectionID()),
+            let uuid = CFUUIDCreateFromString(nil, string.takeRetainedValue()),
+            let displayID = getActiveDisplayList().first(where: {
+                guard let displayUUID = getDisplayUUID(for: $0) else {
+                    return false
+                }
+                return CFEqual(displayUUID, uuid)
+            })
+        else {
+            return CGMainDisplayID()
+        }
+        return displayID
+    }
+}
+
 // MARK: - CGSWindow
 
 extension Bridging {

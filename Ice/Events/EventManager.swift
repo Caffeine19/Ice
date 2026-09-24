@@ -15,6 +15,12 @@ final class EventManager {
     /// Storage for internal observers.
     private var cancellables = Set<AnyCancellable>()
 
+    /// The identifier of the display the mouse was last seen on.
+    private var lastMouseScreenID: CGDirectDisplayID?
+
+    /// A counter used to throttle mouse movement processing.
+    private var mouseMoveThrottleCounter = 0
+
     // MARK: Monitors
 
     /// Monitor for mouse down events.
@@ -57,6 +63,7 @@ final class EventManager {
     private(set) lazy var mouseMovedMonitor = UniversalEventMonitor(
         mask: .mouseMoved
     ) { [weak self] event in
+        self?.handleDisplayChange()
         self?.handleShowOnHover()
         return event
     }
@@ -270,7 +277,9 @@ extension EventManager {
         guard
             let appState,
             appState.settingsManager.generalSettingsManager.showOnHover,
-            !appState.settingsManager.generalSettingsManager.useIceBar,
+            !appState.settingsManager.displaySettingsManager.useIceBar(
+                for: (bestScreen ?? NSScreen.main)?.displayID ?? CGMainDisplayID()
+            ),
             isMouseInsideMenuBar
         else {
             return
@@ -340,6 +349,33 @@ extension EventManager {
             }
             section.controlItem.isVisible = true
         }
+    }
+
+    // MARK: Handle Display Change
+
+    /// Tracks which display the mouse is on and updates control item states
+    /// when the mouse moves to a different display, so that per-display
+    /// settings take effect immediately.
+    private func handleDisplayChange() {
+        // Throttle: process at most every fifth mouse movement event.
+        mouseMoveThrottleCounter += 1
+        guard mouseMoveThrottleCounter >= 5 else {
+            return
+        }
+        mouseMoveThrottleCounter = 0
+
+        guard
+            let appState,
+            let screen = NSScreen.screenWithMouse ?? NSScreen.main
+        else {
+            return
+        }
+        let screenID = screen.displayID
+        guard screenID != lastMouseScreenID else {
+            return
+        }
+        lastMouseScreenID = screenID
+        appState.menuBarManager.updateControlItemStates(for: screen)
     }
 
     // MARK: Handle Show On Hover
