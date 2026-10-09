@@ -170,6 +170,11 @@ extension Defaults {
 
         case menuBarAppearanceConfigurationV2 = "MenuBarAppearanceConfigurationV2"
 
+        // MARK: Menu Bar Item Order
+
+        case savedSectionOrder = "SavedSectionOrder"
+        case knownItemIdentifiers = "KnownItemIdentifiers"
+
         // MARK: Ice Bar Settings
 
         case iceBarLocation = "IceBarLocation"

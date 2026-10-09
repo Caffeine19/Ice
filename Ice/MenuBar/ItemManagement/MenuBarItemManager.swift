@@ -106,6 +106,24 @@ final class MenuBarItemManager: ObservableObject {
     /// Cached window identifiers for the most recent items.
     private var cachedItemWindowIDs = [CGWindowID]()
 
+    /// Persisted per-section item order. Maps section keys ("visible", "hidden",
+    /// "alwaysHidden") to an ordered list of stable item identifiers, from left
+    /// to right in the menu bar.
+    private var savedSectionOrder = [String: [String]]()
+
+    /// Stable identifiers of items that have been seen before, used to
+    /// distinguish genuinely new items from items that merely moved.
+    private var knownItemIdentifiers = Set<String>()
+
+    /// A Boolean value that indicates whether a saved section/order restore is
+    /// in progress. While `true`, the saved section order is not overwritten,
+    /// and the restore chain continues across its own recaches.
+    private var isRestoringItemOrder = false
+
+    /// The time at which the current restore began, used to reset the restore
+    /// flag if it becomes stuck.
+    private var isRestoringItemOrderStartDate: Date?
+
     /// Context values for the current temporarily shown items.
     private var tempShownItemContexts = [TempShownItemContext]()
 
@@ -166,6 +184,7 @@ final class MenuBarItemManager: ObservableObject {
 
     /// Sets up the manager.
     func performSetup() {
+        loadPersistedItemOrder()
         configureCancellables()
     }
 
@@ -312,25 +331,40 @@ extension MenuBarItemManager {
 
     /// Caches the current menu bar items if needed, ensuring that the control
     /// items are in the correct order.
-    func cacheItemsIfNeeded() async {
+    ///
+    /// - Parameter force: When `true`, the cache is updated even if the item
+    ///   windows haven't changed and items have recently moved. Used to pick
+    ///   up the results of internal item moves.
+    func cacheItemsIfNeeded(force: Bool = false) async {
         do {
             try await waitForItemsToStopMoving(timeout: .seconds(1))
         } catch is TaskTimeoutError {
             logSkippingCache(reason: "an item is currently being moved")
             return
         } catch {
-            guard !itemHasRecentlyMoved else {
+            guard force || !itemHasRecentlyMoved else {
                 logSkippingCache(reason: "an item was recently moved")
                 return
             }
         }
 
         let itemWindowIDs = Bridging.getWindowList(option: [.menuBarItems, .activeSpace])
-        if cachedItemWindowIDs == itemWindowIDs {
+        if !force, cachedItemWindowIDs == itemWindowIDs {
             logSkippingCache(reason: "item windows have not changed")
             return
-        } else {
-            cachedItemWindowIDs = itemWindowIDs
+        }
+        let previousWindowIDs = cachedItemWindowIDs
+        cachedItemWindowIDs = itemWindowIDs
+
+        // Reset the restore flag if it has been stuck for too long, so that
+        // stale state can't block section order saves indefinitely.
+        if
+            isRestoringItemOrder,
+            let restoreStartDate = isRestoringItemOrderStartDate,
+            Date.now.timeIntervalSince(restoreStartDate) > 10
+        {
+            isRestoringItemOrder = false
+            isRestoringItemOrderStartDate = nil
         }
 
         var items = MenuBarItem.getMenuBarItems(onScreenOnly: false, activeSpaceOnly: true)
@@ -352,16 +386,511 @@ extension MenuBarItemManager {
                     alwaysHiddenControlItem: alwaysHiddenControlItem
                 )
             }
+
+            // Relocate brand-new items that macOS placed to the left of the
+            // hidden control item, and keep the Ice icon in the visible section.
+            if await relocateNewLeftmostItems(items, hiddenControlItem: hiddenControlItem) {
+                scheduleRestoringRecache()
+                return
+            }
+
+            // Begin a restore chain when apps have restarted and macOS placed
+            // their items somewhere else. The chain continues across the
+            // recaches triggered by its own moves.
+            if
+                !isRestoringItemOrder,
+                windowIDsDisappeared(items, previousWindowIDs: previousWindowIDs),
+                !ownMovesOccurred(within: MenuBarItemManager.restoreCooldown)
+            {
+                isRestoringItemOrder = true
+                isRestoringItemOrderStartDate = .now
+            }
+
+            if isRestoringItemOrder {
+                var didRestore = await restoreItemsToSavedSections(
+                    items,
+                    hiddenControlItem: hiddenControlItem,
+                    alwaysHiddenControlItem: alwaysHiddenControlItem
+                )
+                if !didRestore {
+                    didRestore = await restoreSavedItemOrder(
+                        items,
+                        hiddenControlItem: hiddenControlItem,
+                        alwaysHiddenControlItem: alwaysHiddenControlItem
+                    )
+                }
+                if didRestore {
+                    scheduleRestoringRecache()
+                    return
+                }
+                isRestoringItemOrder = false
+                isRestoringItemOrderStartDate = nil
+            }
+
             uncheckedCacheItems(
                 hiddenControlItem: hiddenControlItem,
                 alwaysHiddenControlItem: alwaysHiddenControlItem,
                 otherItems: items
             )
+            if !isRestoringItemOrder {
+                saveSectionOrder(from: itemCache)
+            }
         } catch {
+            isRestoringItemOrder = false
+            isRestoringItemOrderStartDate = nil
             Logger.itemManager.error("Error enforcing control item order: \(error)")
             Logger.itemManager.debug("Clearing menu bar item cache")
             itemCache.clear()
         }
+    }
+}
+
+// MARK: - Saved Section Order
+
+extension MenuBarItemManager {
+    /// The amount of time to wait before recaching after internal item moves.
+    private static let uiSettleDelay: Duration = .milliseconds(300)
+
+    /// The amount of time after an internal item move during which saved
+    /// section restores are suppressed.
+    private static let restoreCooldown: TimeInterval = 5
+
+    /// Loads the persisted item order data.
+    private func loadPersistedItemOrder() {
+        if let stored = Defaults.dictionary(forKey: .savedSectionOrder) as? [String: [String]] {
+            savedSectionOrder = stored
+        }
+        knownItemIdentifiers = Set(Defaults.stringArray(forKey: .knownItemIdentifiers) ?? [])
+    }
+
+    /// Persists the saved section order.
+    private func persistSavedSectionOrder() {
+        Defaults.set(savedSectionOrder, forKey: .savedSectionOrder)
+    }
+
+    /// Persists the known item identifiers.
+    private func persistKnownItemIdentifiers() {
+        Defaults.set(Array(knownItemIdentifiers), forKey: .knownItemIdentifiers)
+    }
+
+    /// Returns the persistable key for the given section name.
+    private func sectionKey(for section: MenuBarSection.Name) -> String {
+        switch section {
+        case .visible: "visible"
+        case .hidden: "hidden"
+        case .alwaysHidden: "alwaysHidden"
+        }
+    }
+
+    /// Returns the section name for the given persistable key, if valid.
+    private func sectionName(for key: String) -> MenuBarSection.Name? {
+        switch key {
+        case "visible": .visible
+        case "hidden": .hidden
+        case "alwaysHidden": .alwaysHidden
+        default: nil
+        }
+    }
+
+    /// Returns the stable identifier used to persist an item's section.
+    private func stableIdentifier(for item: MenuBarItem) -> String {
+        item.info.description
+    }
+
+    /// Returns the best-known bounds for a menu bar item.
+    private func bestBounds(for item: MenuBarItem) -> CGRect {
+        Bridging.getWindowFrame(for: item.windowID) ?? item.frame
+    }
+
+    /// Returns a Boolean value that indicates whether the app has performed
+    /// an internal item move within the given time interval.
+    private func ownMovesOccurred(within interval: TimeInterval) -> Bool {
+        guard let lastItemMoveStartDate else {
+            return false
+        }
+        return Date.now.timeIntervalSince(lastItemMoveStartDate) <= interval
+    }
+
+    /// Returns a Boolean value that indicates whether previously seen item
+    /// windows have disappeared, which indicates that apps have restarted.
+    private func windowIDsDisappeared(_ items: [MenuBarItem], previousWindowIDs: [CGWindowID]) -> Bool {
+        let currentWindowIDSet = Set(items.map(\.windowID))
+        let previousWindowIDSet = Set(previousWindowIDs)
+        return !previousWindowIDSet.isEmpty && !previousWindowIDSet.isSubset(of: currentWindowIDSet)
+    }
+
+    /// Returns the section the given item is physically in, or `nil` if the
+    /// item straddles a control item boundary.
+    private func findSection(
+        for item: MenuBarItem,
+        hiddenControlItem: MenuBarItem,
+        alwaysHiddenControlItem: MenuBarItem?
+    ) -> MenuBarSection.Name? {
+        let itemBounds = bestBounds(for: item)
+        let hiddenBounds = bestBounds(for: hiddenControlItem)
+        if itemBounds.minX >= hiddenBounds.maxX {
+            return .visible
+        }
+        guard itemBounds.maxX <= hiddenBounds.minX else {
+            return nil
+        }
+        if let alwaysHiddenControlItem {
+            let alwaysHiddenBounds = bestBounds(for: alwaysHiddenControlItem)
+            if itemBounds.maxX <= alwaysHiddenBounds.minX {
+                return .alwaysHidden
+            }
+        }
+        return .hidden
+    }
+
+    /// Returns the destination that places an item at the leftmost edge of
+    /// the given section.
+    private func moveDestination(
+        for section: MenuBarSection.Name,
+        hiddenControlItem: MenuBarItem,
+        alwaysHiddenControlItem: MenuBarItem?
+    ) -> MoveDestination {
+        switch section {
+        case .visible:
+            .rightOfItem(hiddenControlItem)
+        case .hidden:
+            if let alwaysHiddenControlItem {
+                .rightOfItem(alwaysHiddenControlItem)
+            } else {
+                .leftOfItem(hiddenControlItem)
+            }
+        case .alwaysHidden:
+            if let alwaysHiddenControlItem {
+                .leftOfItem(alwaysHiddenControlItem)
+            } else {
+                .leftOfItem(hiddenControlItem)
+            }
+        }
+    }
+
+    /// Extracts the current per-section item order from the given cache and
+    /// persists it. Entries for items that are not currently present (for
+    /// example, items whose apps are closed) are preserved. Skips the write
+    /// when the order has not changed.
+    private func saveSectionOrder(from cache: ItemCache) {
+        var newOrder = [String: [String]]()
+        var currentIdentifiers = Set<String>()
+
+        for section in MenuBarSection.Name.allCases {
+            for item in cache[section] where !item.isIceControlItem {
+                currentIdentifiers.insert(stableIdentifier(for: item))
+            }
+        }
+
+        for section in MenuBarSection.Name.allCases {
+            var identifiers = cache[section]
+                .filter { !$0.isIceControlItem }
+                .map { stableIdentifier(for: $0) }
+
+            // Preserve saved entries for items that are not currently present,
+            // so that their section is remembered while their apps are closed.
+            if let savedIdentifiers = savedSectionOrder[sectionKey(for: section)] {
+                for identifier in savedIdentifiers
+                where !currentIdentifiers.contains(identifier) && !identifiers.contains(identifier) {
+                    identifiers.append(identifier)
+                }
+            }
+
+            if !identifiers.isEmpty {
+                newOrder[sectionKey(for: section)] = identifiers
+            }
+        }
+
+        guard newOrder != savedSectionOrder else {
+            return
+        }
+        savedSectionOrder = newOrder
+        persistSavedSectionOrder()
+        Logger.itemManager.debug("Saved section order: \(newOrder.mapValues(\.count))")
+    }
+
+    /// Relocates brand-new items that macOS placed to the left of the hidden
+    /// control item into the visible section, and keeps the Ice icon and
+    /// non-hideable system items in the visible section.
+    ///
+    /// - Returns: `true` if an item was relocated; the caller should recache.
+    private func relocateNewLeftmostItems(
+        _ items: [MenuBarItem],
+        hiddenControlItem: MenuBarItem
+    ) async -> Bool {
+        // On the first cache pass, seed the known identifiers so that the
+        // baseline items aren't treated as new, then leave everything alone.
+        if knownItemIdentifiers.isEmpty {
+            knownItemIdentifiers = Set(items.filter { !$0.isIceControlItem }.map { stableIdentifier(for: $0) })
+            persistKnownItemIdentifiers()
+            return false
+        }
+
+        let hiddenBounds = bestBounds(for: hiddenControlItem)
+        let leftmostItems = items
+            .filter {
+                $0.frame.maxX <= hiddenBounds.minX &&
+                    $0.isMovable &&
+                    (!$0.isIceControlItem || $0.info == .iceIcon)
+            }
+            .sorted { $0.frame.minX < $1.frame.minX }
+
+        guard !leftmostItems.isEmpty else {
+            return false
+        }
+
+        // The Ice icon must always appear in the visible section.
+        if let iceIcon = leftmostItems.first(where: { $0.info == .iceIcon }) {
+            Logger.itemManager.info("Relocating Ice icon \(iceIcon.logString) to the visible section")
+            do {
+                try await slowMove(item: iceIcon, to: .rightOfItem(hiddenControlItem))
+                return true
+            } catch {
+                Logger.itemManager.error("Failed to relocate Ice icon \(iceIcon.logString): \(error)")
+                return false
+            }
+        }
+
+        // Non-hideable system items must always appear in the visible section.
+        if let systemItem = leftmostItems.first(where: { !$0.canBeHidden }) {
+            Logger.itemManager.info("Relocating non-hideable system item \(systemItem.logString) to the visible section")
+            do {
+                try await slowMove(item: systemItem, to: .rightOfItem(hiddenControlItem))
+                return true
+            } catch {
+                Logger.itemManager.error("Failed to relocate system item \(systemItem.logString): \(error)")
+                return false
+            }
+        }
+
+        // Items that are already cached in the hidden or always-hidden sections
+        // are there intentionally; leave them alone.
+        let hiddenInfos = Set(itemCache[.hidden].map(\.info))
+        let alwaysHiddenInfos = Set(itemCache[.alwaysHidden].map(\.info))
+        let savedIdentifiers = Set(savedSectionOrder.values.flatMap { $0 })
+
+        // Find a hideable item that is genuinely new and has no saved section;
+        // items with saved sections are handled by the restore pass.
+        let candidate = leftmostItems.first { item in
+            let identifier = stableIdentifier(for: item)
+            guard !savedIdentifiers.contains(identifier) else {
+                return false
+            }
+            guard !hiddenInfos.contains(item.info), !alwaysHiddenInfos.contains(item.info) else {
+                return false
+            }
+            return !knownItemIdentifiers.contains(identifier)
+        }
+
+        guard let candidate else {
+            return false
+        }
+
+        knownItemIdentifiers.insert(stableIdentifier(for: candidate))
+        persistKnownItemIdentifiers()
+
+        Logger.itemManager.info("Relocating new item \(candidate.logString) to the visible section")
+        do {
+            try await slowMove(item: candidate, to: .rightOfItem(hiddenControlItem))
+            return true
+        } catch {
+            Logger.itemManager.error("Failed to relocate \(candidate.logString): \(error)")
+            return false
+        }
+    }
+
+    /// Moves items back to their saved sections after their apps restart and
+    /// macOS places them somewhere else. Only one item is moved per call; the
+    /// caller should recache when `true` is returned.
+    private func restoreItemsToSavedSections(
+        _ items: [MenuBarItem],
+        hiddenControlItem: MenuBarItem,
+        alwaysHiddenControlItem: MenuBarItem?
+    ) async -> Bool {
+        guard !savedSectionOrder.isEmpty else {
+            return false
+        }
+
+        // Build a lookup from stable identifiers to their saved sections.
+        var savedSectionForIdentifier = [String: MenuBarSection.Name]()
+        for (sectionKeyString, identifiers) in savedSectionOrder {
+            guard let section = sectionName(for: sectionKeyString) else {
+                continue
+            }
+            for identifier in identifiers {
+                savedSectionForIdentifier[identifier] = section
+            }
+        }
+
+        // Don't interfere with temporarily shown items.
+        let tempShownInfos = Set(tempShownItemContexts.map(\.info))
+
+        // Count items per namespace so that items from apps with multiple icons
+        // can be skipped; restoring them causes shuffling, as the icons
+        // naturally position themselves together.
+        var infosPerNamespace = [MenuBarItemInfo.Namespace: Int]()
+        for item in items where !item.isIceControlItem && item.isMovable && item.canBeHidden {
+            infosPerNamespace[item.info.namespace, default: 0] += 1
+        }
+
+        for item in items where !item.isIceControlItem && item.isMovable && item.canBeHidden {
+            guard !tempShownInfos.contains(item.info) else {
+                continue
+            }
+            guard infosPerNamespace[item.info.namespace] == 1 else {
+                continue
+            }
+            guard
+                let savedSection = savedSectionForIdentifier[stableIdentifier(for: item)],
+                let currentSection = findSection(
+                    for: item,
+                    hiddenControlItem: hiddenControlItem,
+                    alwaysHiddenControlItem: alwaysHiddenControlItem
+                ),
+                currentSection != savedSection
+            else {
+                continue
+            }
+
+            let destination = moveDestination(
+                for: savedSection,
+                hiddenControlItem: hiddenControlItem,
+                alwaysHiddenControlItem: alwaysHiddenControlItem
+            )
+            Logger.itemManager.info("Restoring \(item.logString) from the \(currentSection.logString) to the \(savedSection.logString)")
+            do {
+                try await slowMove(item: item, to: destination)
+            } catch {
+                Logger.itemManager.error("Failed to restore \(item.logString) to the \(savedSection.logString): \(error)")
+                continue
+            }
+
+            // Move one item per pass, letting macOS settle before the next.
+            return true
+        }
+
+        return false
+    }
+
+    /// Restores the saved order of items within each section after their apps
+    /// restart and macOS places them somewhere else.
+    ///
+    /// - Returns: `true` if any items were moved; the caller should recache.
+    private func restoreSavedItemOrder(
+        _ items: [MenuBarItem],
+        hiddenControlItem: MenuBarItem,
+        alwaysHiddenControlItem: MenuBarItem?
+    ) async -> Bool {
+        guard !savedSectionOrder.isEmpty else {
+            return false
+        }
+
+        // Skip items from apps with multiple icons; they naturally position
+        // themselves, and restoring their order causes shuffling.
+        var infosPerNamespace = [MenuBarItemInfo.Namespace: Int]()
+        for item in items where !item.isIceControlItem && item.isMovable && item.canBeHidden {
+            infosPerNamespace[item.info.namespace, default: 0] += 1
+        }
+        guard !infosPerNamespace.values.contains(where: { $0 > 1 }) else {
+            return false
+        }
+
+        // Don't interfere with temporarily shown items.
+        let tempShownInfos = Set(tempShownItemContexts.map(\.info))
+
+        // Classify the current items into sections, preserving their order,
+        // which runs from left to right in the menu bar.
+        var currentSectionItems = [String: [MenuBarItem]]()
+        for item in items where !item.isIceControlItem && item.isMovable && item.canBeHidden {
+            guard !tempShownInfos.contains(item.info) else {
+                continue
+            }
+            if let section = findSection(
+                for: item,
+                hiddenControlItem: hiddenControlItem,
+                alwaysHiddenControlItem: alwaysHiddenControlItem
+            ) {
+                currentSectionItems[sectionKey(for: section), default: []].append(item)
+            }
+        }
+
+        var itemsByID = [String: MenuBarItem]()
+        for item in items where !item.isIceControlItem {
+            itemsByID[stableIdentifier(for: item)] = item
+        }
+
+        var didMove = false
+
+        for section in MenuBarSection.Name.allCases {
+            guard
+                let savedIdentifiers = savedSectionOrder[sectionKey(for: section)],
+                let currentItems = currentSectionItems[sectionKey(for: section)],
+                !currentItems.isEmpty
+            else {
+                continue
+            }
+
+            // Only consider saved identifiers that are present in this section
+            // right now, and skip the section if their relative order already
+            // matches the saved order.
+            let currentIdentifiers = currentItems.map { stableIdentifier(for: $0) }
+            let currentIdentifierSet = Set(currentIdentifiers)
+            let filteredSaved = savedIdentifiers.filter { currentIdentifierSet.contains($0) }
+            let filteredSavedSet = Set(filteredSaved)
+            guard
+                !filteredSaved.isEmpty,
+                currentIdentifiers.filter({ filteredSavedSet.contains($0) }) != filteredSaved
+            else {
+                continue
+            }
+
+            Logger.itemManager.info("Restoring saved item order for the \(section.logString) (\(filteredSaved.count) items)")
+
+            // The saved order runs from left to right, so the first item is the
+            // anchor; each subsequent item is placed to its right.
+            guard let anchor = itemsByID[filteredSaved[0]] else {
+                continue
+            }
+
+            var currentAnchor = anchor
+            for identifier in filteredSaved.dropFirst() {
+                guard let item = itemsByID[identifier] else {
+                    continue
+                }
+                do {
+                    try await slowMove(item: item, to: .rightOfItem(currentAnchor))
+                    didMove = true
+                    // Only advance the anchor after a successful move so that
+                    // the next item targets the last correctly placed position.
+                    currentAnchor = item
+                } catch {
+                    Logger.itemManager.error("Failed to restore position for \(item.logString) in the \(section.logString): \(error)")
+                }
+            }
+        }
+
+        return didMove
+    }
+
+    /// Schedules a forced recache after a short settling delay, so that macOS
+    /// has time to apply internal item moves before the cache is updated again.
+    private func scheduleRestoringRecache() {
+        Task { [weak self] in
+            try? await Task.sleep(for: MenuBarItemManager.uiSettleDelay)
+            guard let self else {
+                return
+            }
+            await cacheItemsIfNeeded(force: true)
+        }
+    }
+}
+
+// MARK: - MenuBarItem Control Info
+
+private extension MenuBarItem {
+    /// A Boolean value that indicates whether the item is one of Ice's control items.
+    var isIceControlItem: Bool {
+        info == .iceIcon || info == .hiddenControlItem || info == .alwaysHiddenControlItem
     }
 }
 
