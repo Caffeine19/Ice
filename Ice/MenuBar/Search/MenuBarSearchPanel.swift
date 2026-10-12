@@ -198,7 +198,8 @@ private struct MenuBarSearchContentView: View {
             .textFieldStyle(.plain)
             .multilineTextAlignment(.leading)
             .font(.system(size: 18))
-            .padding(15)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 15)
             .focused($searchFieldIsFocused)
 
             Divider()
@@ -228,7 +229,10 @@ private struct MenuBarSearchContentView: View {
                     }
                 }
             }
-            .padding(5)
+            // 13 points plus the button's 3-point internal padding aligns
+            // the buttons with the 16-point content column used by the list.
+            .padding(.horizontal, 13)
+            .padding(.vertical, 5)
             .background(.thinMaterial)
         }
         .background {
@@ -259,6 +263,7 @@ private struct MenuBarSearchContentView: View {
                 Text(section.displayString)
                     .fontWeight(.semibold)
                     .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.vertical, 10)
             }
@@ -357,7 +362,6 @@ private struct SettingsButton: View {
                 .aspectRatio(contentMode: .fit)
                 .frame(width: 18, height: 18)
                 .foregroundStyle(.secondary)
-                .padding(2)
         }
     }
 }
