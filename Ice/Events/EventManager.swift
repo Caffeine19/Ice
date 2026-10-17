@@ -333,6 +333,10 @@ extension EventManager {
         // Notify each overlay panel that a menu bar item is being dragged.
         appState.appearanceManager.setIsDraggingMenuBarItem(true)
 
+        // Record the drag as a user move, so that it is saved immediately
+        // and is never reverted as drift.
+        appState.itemManager.noteUserMove()
+
         // Don't continue if the setting to show the sections is disabled.
         guard appState.settingsManager.advancedSettingsManager.showAllSectionsOnUserDrag else {
             return

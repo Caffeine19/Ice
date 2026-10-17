@@ -134,6 +134,7 @@ final class LayoutBarPaddingView: NSView {
         Task {
             try await Task.sleep(for: .milliseconds(25))
             do {
+                appState.itemManager.noteUserMove()
                 try await appState.itemManager.slowMove(item: item, to: destination)
                 appState.itemManager.removeTempShownItemFromCache(with: item.info)
             } catch {

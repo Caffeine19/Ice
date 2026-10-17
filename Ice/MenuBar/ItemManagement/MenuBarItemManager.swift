@@ -124,6 +124,18 @@ final class MenuBarItemManager: ObservableObject {
     /// flag if it becomes stuck.
     private var isRestoringItemOrderStartDate: Date?
 
+    /// The time at which a divergence from the saved section order was first
+    /// observed. The divergence is acted on only after a second consecutive
+    /// observation, so that transient arrangements are not reacted to.
+    private var pendingDivergenceObservedAt: Date?
+
+    /// A Boolean value that indicates whether the startup settling period is
+    /// active. While `true`, section order saves and restores are suppressed.
+    private var isInStartupSettling = false
+
+    /// The task that ends the startup settling period.
+    private var startupSettlingTask: Task<Void, Never>?
+
     /// Context values for the current temporarily shown items.
     private var tempShownItemContexts = [TempShownItemContext]()
 
@@ -132,6 +144,17 @@ final class MenuBarItemManager: ObservableObject {
 
     /// The last time a menu bar item was moved.
     private var lastItemMoveStartDate: Date?
+
+    /// The last time the user manually moved a menu bar item.
+    private var lastUserMoveStartDate: Date?
+
+    /// The task that persists the user's move after it completes.
+    private var userMoveSaveTask: Task<Void, Never>?
+
+    /// The last time an automatic item move failed. Section order saves are
+    /// suppressed for a short time after a failure, so that the failed move's
+    /// transient arrangement is not persisted as the user's layout.
+    private var lastFailedMoveStartDate: Date?
 
     /// The last time the mouse was moved.
     private var lastMouseMoveStartDate: Date?
@@ -177,6 +200,35 @@ final class MenuBarItemManager: ObservableObject {
         return Date.now.timeIntervalSince(lastMouseMoveStartDate) <= 1
     }
 
+    /// Marks that the user manually moved a menu bar item. The move must be
+    /// saved immediately and must never be treated as drift and reverted, so
+    /// the divergence evaluation is suppressed and the save cooldown is
+    /// exempted until the next automatic move. A forced cache pass is
+    /// scheduled so that the drag is persisted before any restore can revert
+    /// it: the save must win.
+    func noteUserMove() {
+        lastUserMoveStartDate = .now
+        lastItemMoveStartDate = .now
+        pendingDivergenceObservedAt = nil
+        scheduleUserMoveSave()
+    }
+
+    /// Schedules forced cache passes that persist the user's move. The passes
+    /// retry briefly, as the move may still be settling (a native drag can
+    /// continue for several seconds after the last drag event).
+    private func scheduleUserMoveSave() {
+        userMoveSaveTask?.cancel()
+        userMoveSaveTask = Task { [weak self] in
+            for _ in 0..<3 {
+                try? await Task.sleep(for: .seconds(1.5))
+                guard let self, !Task.isCancelled else {
+                    return
+                }
+                await self.cacheItemsIfNeeded(force: true)
+            }
+        }
+    }
+
     /// Creates a manager with the given app state.
     init(appState: AppState) {
         self.appState = appState
@@ -186,6 +238,28 @@ final class MenuBarItemManager: ObservableObject {
     func performSetup() {
         loadPersistedItemOrder()
         configureCancellables()
+        startStartupSettlingPeriod()
+    }
+
+    /// Suppresses section order saves and restores for a settling period after
+    /// launch. During login, many apps load over ~30 seconds, each triggering
+    /// cache cycles; without this guard, the transient arrangement would be
+    /// saved as the user's layout. After the period ends, one final cache pass
+    /// enforces the saved layout against whatever macOS placed items.
+    private func startStartupSettlingPeriod() {
+        startupSettlingTask?.cancel()
+        isInStartupSettling = true
+        let delay: Duration = ProcessInfo.processInfo.systemUptime < 60 ? .seconds(30) : .seconds(5)
+        Logger.itemManager.debug("Startup settling period started (delay: \(delay))")
+        startupSettlingTask = Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            guard let self, !Task.isCancelled else {
+                return
+            }
+            self.isInStartupSettling = false
+            Logger.itemManager.debug("Startup settling period ended; enforcing the saved layout")
+            await self.cacheItemsIfNeeded(force: true)
+        }
     }
 
     /// Configures the internal observers for the manager.
@@ -394,16 +468,37 @@ extension MenuBarItemManager {
                 return
             }
 
-            // Begin a restore chain when apps have restarted and macOS placed
-            // their items somewhere else. The chain continues across the
-            // recaches triggered by its own moves.
+            // Begin a restore chain when the physical layout diverges from the
+            // saved layout, or when apps have restarted and macOS placed their
+            // items somewhere else. A divergence is acted on only after a
+            // second consecutive observation, so that transient arrangements
+            // (such as a space switch re-exposing hidden items) are not reacted
+            // to. The evaluation is suppressed for a short period after any
+            // move so that the user's own drag is never treated as drift. The
+            // chain continues across the recaches triggered by its own moves.
             if
                 !isRestoringItemOrder,
-                windowIDsDisappeared(items, previousWindowIDs: previousWindowIDs),
+                !isInStartupSettling,
                 !ownMovesOccurred(within: MenuBarItemManager.restoreCooldown)
             {
-                isRestoringItemOrder = true
-                isRestoringItemOrderStartDate = .now
+                let diverges = layoutDivergesFromSaved(
+                    items,
+                    hiddenControlItem: hiddenControlItem,
+                    alwaysHiddenControlItem: alwaysHiddenControlItem
+                )
+                let restarted = windowIDsDisappeared(items, previousWindowIDs: previousWindowIDs)
+                if diverges, !restarted, pendingDivergenceObservedAt == nil {
+                    // First sighting; confirm on a later cache pass before
+                    // acting. Saves are blocked until this resolves.
+                    pendingDivergenceObservedAt = .now
+                    scheduleDivergenceConfirmation()
+                } else if diverges || restarted {
+                    pendingDivergenceObservedAt = nil
+                    isRestoringItemOrder = true
+                    isRestoringItemOrderStartDate = .now
+                } else {
+                    pendingDivergenceObservedAt = nil
+                }
             }
 
             if isRestoringItemOrder {
@@ -432,9 +527,11 @@ extension MenuBarItemManager {
                 alwaysHiddenControlItem: alwaysHiddenControlItem,
                 otherItems: items
             )
-            if !isRestoringItemOrder {
-                saveSectionOrder(from: itemCache)
-            }
+            saveSectionOrderIfStable(
+                hiddenControlItem: hiddenControlItem,
+                alwaysHiddenControlItem: alwaysHiddenControlItem,
+                otherItems: items
+            )
         } catch {
             isRestoringItemOrder = false
             isRestoringItemOrderStartDate = nil
@@ -454,6 +551,10 @@ extension MenuBarItemManager {
     /// The amount of time after an internal item move during which saved
     /// section restores are suppressed.
     private static let restoreCooldown: TimeInterval = 5
+
+    /// The amount of time to wait before verifying a suspected divergence from
+    /// the saved section order on a second cache pass.
+    private static let divergenceConfirmDelay: Duration = .seconds(1)
 
     /// Loads the persisted item order data.
     private func loadPersistedItemOrder() {
@@ -517,6 +618,182 @@ extension MenuBarItemManager {
         let currentWindowIDSet = Set(items.map(\.windowID))
         let previousWindowIDSet = Set(previousWindowIDs)
         return !previousWindowIDSet.isEmpty && !previousWindowIDSet.isSubset(of: currentWindowIDSet)
+    }
+
+    /// A Boolean value that indicates whether the most recent move was made by
+    /// the user, in which case the save cooldown is waived so that the drag is
+    /// persisted before anything can treat it as drift.
+    private var isUserMoveExemptFromCooldown: Bool {
+        guard let lastUserMoveStartDate else {
+            return false
+        }
+        guard let lastItemMoveStartDate else {
+            return true
+        }
+        return lastUserMoveStartDate >= lastItemMoveStartDate
+    }
+
+    /// Schedules a cache pass that verifies a suspected divergence from the
+    /// saved section order, so that transient arrangements are not reacted to.
+    private func scheduleDivergenceConfirmation() {
+        Task { [weak self] in
+            try? await Task.sleep(for: MenuBarItemManager.divergenceConfirmDelay)
+            guard let self else {
+                return
+            }
+            await cacheItemsIfNeeded(force: true)
+        }
+    }
+
+    /// Returns a Boolean value that indicates whether any item is in a
+    /// different section than the one saved for it.
+    ///
+    /// Catches drift that keeps window IDs intact (for example display
+    /// reconfigurations or neighboring items appearing and disappearing),
+    /// which the window-ID-based restart detection cannot see.
+    private func layoutDivergesFromSaved(
+        _ items: [MenuBarItem],
+        hiddenControlItem: MenuBarItem,
+        alwaysHiddenControlItem: MenuBarItem?
+    ) -> Bool {
+        guard !savedSectionOrder.isEmpty else {
+            return false
+        }
+
+        var savedSectionForIdentifier = [String: MenuBarSection.Name]()
+        for (sectionKeyString, identifiers) in savedSectionOrder {
+            guard let section = sectionName(for: sectionKeyString) else {
+                continue
+            }
+            for identifier in identifiers {
+                savedSectionForIdentifier[identifier] = section
+            }
+        }
+
+        // Don't interfere with temporarily shown items.
+        let tempShownInfos = Set(tempShownItemContexts.map(\.info))
+
+        // Skip items from apps with multiple icons, as restoring them is
+        // skipped as well; they naturally position themselves together.
+        var infosPerNamespace = [MenuBarItemInfo.Namespace: Int]()
+        for item in items where !item.isIceControlItem && item.isMovable && item.canBeHidden {
+            infosPerNamespace[item.info.namespace, default: 0] += 1
+        }
+
+        for item in items where !item.isIceControlItem && item.isMovable && item.canBeHidden {
+            guard !tempShownInfos.contains(item.info) else {
+                continue
+            }
+            guard infosPerNamespace[item.info.namespace] == 1 else {
+                continue
+            }
+            guard
+                let savedSection = savedSectionForIdentifier[stableIdentifier(for: item)],
+                let currentSection = findSection(
+                    for: item,
+                    hiddenControlItem: hiddenControlItem,
+                    alwaysHiddenControlItem: alwaysHiddenControlItem
+                ),
+                currentSection != savedSection
+            else {
+                continue
+            }
+            return true
+        }
+        return false
+    }
+
+    /// Persists the section order unless the current arrangement cannot be
+    /// trusted to represent the user's layout. Each guard logs its own reason
+    /// so that skipped saves are easy to find in the log.
+    private func saveSectionOrderIfStable(
+        hiddenControlItem: MenuBarItem,
+        alwaysHiddenControlItem: MenuBarItem?,
+        otherItems: [MenuBarItem]
+    ) {
+        guard !isRestoringItemOrder else {
+            Logger.itemManager.warning("Skipping saveSectionOrder; a section order restore is in progress")
+            return
+        }
+        guard !isInStartupSettling else {
+            Logger.itemManager.warning("Skipping saveSectionOrder; the startup settling period is active")
+            return
+        }
+        guard pendingDivergenceObservedAt == nil else {
+            Logger.itemManager.warning("Skipping saveSectionOrder; a layout divergence is pending confirmation")
+            return
+        }
+        guard tempShownItemContexts.isEmpty else {
+            Logger.itemManager.warning("Skipping saveSectionOrder; temporarily shown items are present")
+            return
+        }
+        if
+            appState?.settingsManager.advancedSettingsManager.enableAlwaysHiddenSection == true,
+            alwaysHiddenControlItem == nil
+        {
+            Logger.itemManager.warning("Skipping saveSectionOrder; the always-hidden divider is unresolved while its section is enabled")
+            return
+        }
+        if
+            let alwaysHiddenControlItem,
+            hiddenControlItem.frame.minX < alwaysHiddenControlItem.frame.maxX
+        {
+            Logger.itemManager.warning("Skipping saveSectionOrder; the hidden section has zero width between the dividers")
+            return
+        }
+        let hasBlockedItems = otherItems.contains { !$0.isIceControlItem && $0.frame.origin.x == -1 }
+        guard !hasBlockedItems else {
+            Logger.itemManager.warning("Skipping saveSectionOrder; blocked items detected (x=-1), will retry on the next cache pass")
+            return
+        }
+        if itemsSpanMultipleDisplays(otherItems) {
+            Logger.itemManager.warning("Skipping saveSectionOrder; menu bar items span multiple displays (a relocation is in progress)")
+            return
+        }
+        if ownMovesOccurred(within: MenuBarItemManager.restoreCooldown), !isUserMoveExemptFromCooldown {
+            Logger.itemManager.warning("Skipping saveSectionOrder; within the move cooldown after an automatic move")
+            return
+        }
+        if failedMoveOccurred(within: MenuBarItemManager.restoreCooldown) {
+            Logger.itemManager.warning("Skipping saveSectionOrder; this cache refresh follows a failed automatic move attempt")
+            return
+        }
+        saveSectionOrder(from: itemCache)
+    }
+
+    /// Returns a Boolean value that indicates whether an automatic item move
+    /// has failed within the given time interval.
+    private func failedMoveOccurred(within interval: TimeInterval) -> Bool {
+        guard let lastFailedMoveStartDate else {
+            return false
+        }
+        return Date.now.timeIntervalSince(lastFailedMoveStartDate) <= interval
+    }
+
+    /// Returns a Boolean value that indicates whether the given items span
+    /// more than one display, which means that a relocation is in progress.
+    private func itemsSpanMultipleDisplays(_ items: [MenuBarItem]) -> Bool {
+        let screens = NSScreen.screens
+        guard screens.count > 1 else {
+            return false
+        }
+        // Menu bar item frames use the CG coordinate space (origin at the top
+        // left of the main display), while screen frames use the AppKit
+        // coordinate space (origin at the bottom left of the main display).
+        // Parked items sit at negative x and are excluded.
+        let primaryHeight = screens.first { $0.frame.origin == .zero }?.frame.height ?? screens[0].frame.height
+        var screensSeen = Set<Int>()
+        for item in items where !item.isIceControlItem && item.frame.origin.x >= 0 {
+            let cgPoint = CGPoint(x: item.frame.midX, y: item.frame.midY)
+            let cocoaPoint = CGPoint(x: cgPoint.x, y: primaryHeight - cgPoint.y)
+            if let index = screens.firstIndex(where: { $0.frame.contains(cocoaPoint) }) {
+                screensSeen.insert(index)
+                if screensSeen.count > 1 {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     /// Returns the section the given item is physically in, or `nil` if the
@@ -604,9 +881,33 @@ extension MenuBarItemManager {
         guard newOrder != savedSectionOrder else {
             return
         }
+        logSavedOrderChanges(from: savedSectionOrder, to: newOrder)
         savedSectionOrder = newOrder
         persistSavedSectionOrder()
         Logger.itemManager.debug("Saved section order: \(newOrder.mapValues(\.count))")
+    }
+
+    /// Logs the items whose saved section changed, so that unexpected
+    /// membership changes can be traced in the log.
+    private func logSavedOrderChanges(from oldOrder: [String: [String]], to newOrder: [String: [String]]) {
+        var oldSections = [String: String]()
+        for (key, identifiers) in oldOrder {
+            for identifier in identifiers {
+                oldSections[identifier] = key
+            }
+        }
+        var newSections = [String: String]()
+        for (key, identifiers) in newOrder {
+            for identifier in identifiers {
+                newSections[identifier] = key
+            }
+        }
+        for (identifier, key) in newSections where oldSections[identifier] != key {
+            Logger.itemManager.info("Saved section for \(identifier): \(oldSections[identifier] ?? "none") -> \(key)")
+        }
+        for identifier in oldSections.keys where newSections[identifier] == nil {
+            Logger.itemManager.info("Removed saved section for \(identifier)")
+        }
     }
 
     /// Relocates brand-new items that macOS placed to the left of the hidden
@@ -1624,6 +1925,11 @@ extension MenuBarItemManager {
                 try await wakeUpItem(item)
                 Logger.itemManager.info("Retrying move of \(item.logString)")
                 continue
+            } catch {
+                // All attempts failed; stamp the failure so that section order
+                // saves are suppressed until the arrangement settles.
+                lastFailedMoveStartDate = .now
+                throw error
             }
         }
     }
