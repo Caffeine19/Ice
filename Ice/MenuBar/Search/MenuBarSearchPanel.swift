@@ -261,7 +261,6 @@ private struct MenuBarSearchContentView: View {
         let searchItems: [(listItem: ListItem, title: String)] = MenuBarSection.Name.allCases.reduce(into: []) { items, section in
             let headerItem = ListItem.header(id: .header(section)) {
                 Text(section.displayString)
-                    .fontWeight(.semibold)
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 8)
                     .frame(maxWidth: .infinity, alignment: .leading)
