@@ -224,6 +224,15 @@ private struct MenuBarSearchContentView: View {
                     let selection,
                     let item = menuBarItem(for: selection)
                 {
+                    if
+                        let section = itemManager.itemCache.section(for: item),
+                        section == .visible || section == .hidden
+                    {
+                        ToggleItemHiddenButton(isHidden: section == .hidden) {
+                            toggleItem(item)
+                        }
+                        FooterDivider()
+                    }
                     ShowItemButton(item: item) {
                         performAction(for: item)
                     }
@@ -250,6 +259,11 @@ private struct MenuBarSearchContentView: View {
         }
         .onChange(of: itemManager.itemCache, initial: true) {
             updateDisplayedItems()
+        }
+        .onKeyDown(key: .h, modifiers: .command) {
+            DispatchQueue.main.async {
+                toggleSelectedItem()
+            }
         }
     }
 
@@ -306,6 +320,53 @@ private struct MenuBarSearchContentView: View {
         Task {
             try await Task.sleep(for: .milliseconds(25))
             itemManager.tempShowItem(item, clickWhenFinished: true, mouseButton: .left)
+        }
+    }
+
+    private func toggleSelectedItem() {
+        guard
+            let selection,
+            let item = menuBarItem(for: selection),
+            let section = itemManager.itemCache.section(for: item),
+            section == .visible || section == .hidden
+        else {
+            return
+        }
+        toggleItem(item)
+    }
+
+    private func toggleItem(_ item: MenuBarItem) {
+        guard !itemManager.isMovingItem else {
+            return
+        }
+        Task {
+            try await Task.sleep(for: .milliseconds(25))
+            do {
+                let items = MenuBarItem.getMenuBarItems(onScreenOnly: false, activeSpaceOnly: true)
+                guard let hiddenControlItem = items.first(where: { $0.info == .hiddenControlItem }) else {
+                    return
+                }
+                let destination: MenuBarItemManager.MoveDestination
+                switch itemManager.itemCache.section(for: item) {
+                case .visible:
+                    // Move into the hidden section, just left of the divider.
+                    destination = .leftOfItem(hiddenControlItem)
+                case .hidden:
+                    // Move back into the visible section, just right of the divider.
+                    destination = .rightOfItem(hiddenControlItem)
+                default:
+                    return
+                }
+                try await itemManager.slowMove(item: item, to: destination)
+                itemManager.removeTempShownItemFromCache(with: item.info)
+                // Note the move only after it completes, so that the move is recorded
+                // as intentional and the new section is persisted. Noting it before the
+                // move would leave the save exempt from the cooldown and the
+                // reconciliation layer could restore the item to its old section.
+                itemManager.noteUserMove()
+            } catch {
+                Logger.searchPanel.error("Error toggling the menu bar item's section: \(error)")
+            }
         }
     }
 }
@@ -373,7 +434,6 @@ private struct ShowItemButton: View {
         BottomBarButton(action: action) {
             HStack {
                 Text(item.isOnScreen ? "Click item" : "Show item")
-                    .padding(.horizontal, 5)
 
                 Image(systemName: "return")
                     .resizable()
@@ -389,6 +449,39 @@ private struct ShowItemButton: View {
                     }
             }
         }
+    }
+}
+
+private struct ToggleItemHiddenButton: View {
+    let isHidden: Bool
+    let action: () -> Void
+
+    var body: some View {
+        BottomBarButton(action: action) {
+            HStack {
+                Text(isHidden ? "Unhide" : "Hide")
+
+                Text("⌘H")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 5)
+                    .background {
+                        VisualEffectView(material: .selection, blendingMode: .withinWindow)
+                            .clipShape(RoundedRectangle(cornerRadius: 3, style: .circular))
+                            .opacity(0.5)
+                    }
+            }
+        }
+    }
+}
+
+private struct FooterDivider: View {
+    var body: some View {
+        Capsule()
+            .fill(.secondary)
+            .frame(width: 1, height: 10)
+            .opacity(0.3)
     }
 }
 
@@ -464,4 +557,10 @@ private struct MenuBarSearchItemView: View {
             }
         }
     }
+}
+
+// MARK: - Logger
+private extension Logger {
+    /// The logger to use for the menu bar search panel.
+    static let searchPanel = Logger(category: "MenuBarSearchPanel")
 }
