@@ -438,7 +438,7 @@ private struct ShowItemButton: View {
                 Image(systemName: "return")
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: 11, height: 11)
+                    .frame(width: 11, height: 12)
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 7)
                     .padding(.vertical, 5)
@@ -464,6 +464,7 @@ private struct ToggleItemHiddenButton: View {
                 Text("⌘H")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+                    .frame(height: 12)
                     .padding(.horizontal, 7)
                     .padding(.vertical, 5)
                     .background {
