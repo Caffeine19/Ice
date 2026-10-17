@@ -1,0 +1,48 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run App",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/run.sh",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": { "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Verify Build",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/verify.sh",
+      "group": "build",
+      "presentation": { "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Release App",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/release.sh '${input:releaseTag}'",
+      "group": "build",
+      "presentation": { "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Publish Release",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/publish.sh '${input:releaseTag}'",
+      "group": "build",
+      "presentation": { "clear": true },
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "releaseTag",
+      "type": "promptString",
+      "description": "Release tag (e.g. 0.12.0-fork.1)",
+      "default": "0.12.0-fork.1"
+    }
+  ]
+}
