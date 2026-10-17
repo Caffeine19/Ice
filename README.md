@@ -81,6 +81,22 @@ brew install jordanbaird-ice
 - [x] Automatic updates
 - [ ] Menu bar widgets
 
+## Additional Features in This Fork
+
+This fork builds on upstream Ice with the following extra features:
+
+- Per-display Ice Bar settings
+  - A new _Displays_ pane lets you configure Use Ice Bar, Always show hidden items, and Location independently for each display. Settings are remembered per display, so docking or undocking an external monitor never requires toggling the Ice Bar again. The Ice Bar hotkey now toggles the active display's setting, and existing global settings are migrated automatically.
+- Menu bar layout memory
+  - Each item's section (visible / hidden / always-hidden) and its order are remembered and automatically restored after app restarts or when items drift out of place. Brand-new items that land in the wrong section are relocated to the visible section. Startup settling and save gating keep transient layouts from being remembered, and your manual drags always win.
+- Search panel
+  - Ctrl+N / Ctrl+P navigation
+    - Emacs-style next/previous selection in the search panel list, sharing the arrow keys' stop-at-ends and section-header-skipping behavior.
+  - Visual refinements
+    - Content aligned to a single column (search field, section headers, item content, and bottom-bar buttons all share the same edges) and regular-weight section headers.
+- Settings window defaults to Menu Bar Layout
+  - The settings window opens on the _Menu Bar Layout_ pane instead of _General_.
+
 ## Why does Ice only support macOS 14 and later?
 
 Ice uses a number of system APIs that are available starting in macOS 14. As such, there are no plans to support earlier versions of macOS.
